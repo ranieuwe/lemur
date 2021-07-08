@@ -1,3 +1,131 @@
+# Lemur with Azure Blob Storage support
+
+## Introduction
+
+This project is a version of Lemur providing a copy tool that supports Azure Blob Storage. 
+
+Lustre has a concept called Hierarchical Storage Management, or HSM. HSM is a backend to Lustre, that could for example be a POSIX file store, a tape system, or modern blob storage. For Lustre to be able to move data between Lustre and HSM it needs a copy tool. Lemur is such a tool.
+
+## How to build the binaries without Docker
+
+### Prerequisites
+
+In order to build the binaries for Lemur you need to have the following available:
+
+* A machine with the `lustre-client` package installed, CentOS 7.x or RHEL 7.x work well. To install from rpm use `yum install -y lustre-client`.
+* A recent version of Go. If you need a quick way to install go, look at [canha/golang-tools-install-script](https://github.com/canha/golang-tools-install-script).
+* An active GOPATH set up
+
+If you don't want to do the prep for the environment, then consider using the [Terraform templates](https://github.com/Azure/azlustre/tree/main/terraform) that build a Lustre cluster for you.
+
+### Build instructions
+
+This repository has been tested with Lustre 2.12 and higher, but will compile for 2.10 too if needed. If you need 2.10, please adjust the CGO_CFLAGS to point to the correct 2.10 headers.
+
+```bash
+git clone https://github.com/wastore/lemur.git
+cd lemur/
+export CGO_CFLAGS='-I/usr/src/lustre-2.12.5/lustre/include -I/usr/src/lustre-2.12.5/lustre/include/uapi'
+go build -v -i -ldflags "-X 'main.version=0.6.0_56_g286df59_dirty'" -o dist/lhsm-plugin-az ./cmd/lhsm-plugin-az
+```
+
+This will create a binary `lhsm-plugin-az` in the `lemur/dist/` directory.
+
+
+
+## How to use this tool
+
+### Prerequisites 
+
+* Set up a Lustre system, including MGS, MDT and OSS nodes.
+* You will need a separate node for the copy tool, because the copy tool basically functions as a client of Lustre. Install a lustre-client on this node.
+
+### Configuration
+
+#### Ensure HSM is enabled, it is not enabled by default
+
+You need to enable HSM on your Lustre cluster. Depending on your set up this may not be enabled yet. To enable the HSM please execute the following bits from one of your Lustre client machines (e.g. your target HSM machine) where your Lustre file system is currently mounted.
+
+```bash
+lctl set_param -P mdt.*-MDT0000.hsm_control=enabled
+lctl set_param -P mdt.*-MDT0000.hsm.default_archive_id=1
+lctl set_param mdt.*-MDT0000.hsm.max_requests=128
+```
+
+#### Configure the plugin
+
+Copy your `lhsm-plugin-az` binary to a plugin directory, typically `/usr/libexec/lhsmd`. You will need to set up the lhsmd agent at `/etc/lhsmd/agent` and the configuration for the azure plugin at `/etc/lhsmd/lhsm-plugin-az`. 
+
+A sample `/etc/lhsmd/agent` is:
+
+```
+# Lustre NID and filesystem name for the front end filesystem, the agent will mount this.
+# This is <mgs_ip>@tcp:/<fs_name>
+client_device="10.10.4.6@tcp:/lustrefs" 
+
+enabled_plugins=["lhsm-plugin-az"] 
+
+# Directory to look for the plugins
+plugin_dir="/usr/libexec/lhsmd"
+
+handler_count=16
+
+snapshots {
+        enabled = false
+}
+```
+
+A sample `/etc/lhsmd/lhsm-plugin-az` looks like this:
+```
+az_storage_account = "$storage_account"
+az_storage_key = "$storage_key"
+num_threads = 32
+
+# One or more archive definition is required.
+
+archive "az-blob" {
+    id = 1                           # Must be unique to this endpoint
+    container = "$storage_container" # Container used for this archive
+    prefix = ""                      # Optional prefix
+    num_threads = 32
+}
+```
+
+#### Validate that it all works
+
+Fire up lhsmd using the `--debug` flag and check for any errors. 
+
+#### Set up LHSMD as a service
+
+You can run LHSMD from your shell directly, in a terminal emulator, but it is easier to do as a service. Set LHSMD as a service with a systemd script and start the service.
+
+
+```bash
+cat <<EOF >/etc/systemd/system/lhsmd.service
+[Unit]
+Description=The lhsmd server
+After=syslog.target network.target remote-fs.target nss-lookup.target
+[Service]
+Type=simple
+PIDFile=/run/lhsmd.pid
+ExecStartPre=/bin/mkdir -p /var/run/lhsmd
+ExecStart=/sbin/lhsmd -config /etc/lhsmd/agent
+Restart=always
+[Install]
+WantedBy=multi-user.target
+EOF
+
+chmod 600 /etc/systemd/system/lhsmd.service
+
+systemctl daemon-reload
+systemctl enable lhsmd
+systemctl start lhsmd
+```
+
+### Usage
+
+Once installed you can use `lfs hsm_*` commands to interact with HSM and move a file to Azure Blob Storage and back. 
+
 ## How to build executable for CBLD environment and run tests
 
 This doc briefly goes over the steps involved in building the plugin for testing inside a deployed Lustre cluster.
